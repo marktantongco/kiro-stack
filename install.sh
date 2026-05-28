@@ -1,5 +1,5 @@
 #!/bin/bash
-# 🦉 Kiro Stack — Unified Installer v1.0
+# 🦉 Kiro Stack — Unified Installer v1.1
 # Installs: kiro-gateway (Python proxy) + kirolink (Go token/proxy) + kiro-cli auth
 # Target: opencode TUI with direct kiro-gateway access + Claude Code via kirolink
 set -euo pipefail
@@ -17,10 +17,20 @@ VENV_DIR="$KIRO_DIR/.venv"
 SYSD_DIR="$HOME/.config/systemd/user"
 GATEWAY_SERVICE="kiro-gateway.service"
 KIROLINK_SERVICE="kirolink.service"
+REFRESH_SERVICE="kiro-auth-refresh.service"
+REFRESH_TIMER="kiro-auth-refresh.timer"
 OPENCODE_CONFIG="$HOME/.config/opencode/opencode.jsonc"
 KIRO_CLI_DB="$HOME/.local/share/kiro-cli/data.sqlite3"
 TOKEN_FILE="$HOME/.aws/sso/cache/kiro-auth-token.json"
 CUSTOM_MODELS="auto-kiro claude-sonnet-4.5 claude-haiku-4.5 claude-sonnet-4 deepseek-3.2 glm-5 minimax-m2.5 minimax-m2.1 qwen3-coder-next"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENDOR_DIR="$SCRIPT_DIR/vendor"
+
+# ── Argument defaults ──────────────────────────────────────────────────────
+NON_INTERACTIVE=false
+FLAG_KIROLINK_SERVICE=false
+FLAG_SKIP_LOGIN=false
+FLAG_SKIP_OPENCODE=false
 
 # ── Terminal formatting ────────────────────────────────────────────────────
 BOLD='\033[1m'
@@ -37,17 +47,77 @@ err()   { echo -e "${RED}✗${NC} $1"; fail=1; }
 step()  { echo; echo -e "${BOLD}[$1/$2]${NC} $3"; }
 fail=0
 
-TOTAL_STEPS=12
+TOTAL_STEPS=13
+
+# ── Help ───────────────────────────────────────────────────────────────────
+show_help() {
+    echo "Usage: ./install.sh [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --non-interactive   Run without prompts (uses defaults: no kirolink service,"
+    echo "                      reuse existing login, wire opencode)"
+    echo "  --kirolink-service  Install kirolink as a systemd service (implies non-interactive"
+    echo "                      for that prompt only)"
+    echo "  --skip-login        Skip kiro-cli login step (use existing session)"
+    echo "  --skip-opencode     Skip opencode.jsonc wiring"
+    echo "  -h, --help          Show this message"
+    echo ""
+    echo "Environment variables:"
+    echo "  KIRO_GATEWAY_REPO   Override kiro-gateway git URL"
+    echo "  KIROLINK_REPO       Override kirolink git URL"
+    echo "  KIRO_PORT           Gateway port (default: 8333)"
+    echo "  KIRO_API_KEY        Gateway API key (default: kiro-gateway-8333)"
+    echo ""
+    echo "Vendor fallback:"
+    echo "  If git clone fails, the installer falls back to vendored source in"
+    echo "  vendor/kiro-gateway/ and vendor/kirolink/."
+    echo ""
+    echo "Examples:"
+    echo "  ./install.sh                                          # Full interactive"
+    echo "  ./install.sh --non-interactive --kirolink-service      # Headless full install"
+    echo "  ./install.sh --skip-login --skip-opencode              # Quick reinstall"
+    exit 0
+}
+
+# ── Argument parsing ───────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --non-interactive) NON_INTERACTIVE=true ;;
+        --kirolink-service) FLAG_KIROLINK_SERVICE=true ;;
+        --skip-login) FLAG_SKIP_LOGIN=true ;;
+        --skip-opencode) FLAG_SKIP_OPENCODE=true ;;
+        -h|--help) show_help ;;
+        --dry-run)
+            # Dry-run mode: just validate syntax and config, don't execute
+            info "Dry-run mode: validating configuration"
+            echo "  KIRO_DIR=$KIRO_DIR"
+            echo "  KIROLINK_DIR=$KIROLINK_DIR"
+            echo "  KIRO_PORT=$KIRO_PORT"
+            echo "  SYSD_DIR=$SYSD_DIR"
+            echo "  VENDOR_DIR=$VENDOR_DIR"
+            echo "  NON_INTERACTIVE=$NON_INTERACTIVE"
+            echo "  FLAG_KIROLINK_SERVICE=$FLAG_KIROLINK_SERVICE"
+            echo "  FLAG_SKIP_LOGIN=$FLAG_SKIP_LOGIN"
+            echo "  FLAG_SKIP_OPENCODE=$FLAG_SKIP_OPENCODE"
+            exit 0
+            ;;
+        *) err "Unknown option: $1"; echo "  Use --help for usage."; exit 1 ;;
+    esac
+    shift
+done
 
 # ── Header ─────────────────────────────────────────────────────────────────
 echo ""
-echo -e "${BOLD}  🦉 Kiro Stack — Unified Installer${NC}"
+echo -e "${BOLD}  🦉 Kiro Stack — Unified Installer v1.1${NC}"
 echo "  kiro-gateway (Python proxy) + kirolink (Go token/proxy) + kiro-cli"
 echo "  ───────────────────────────────────────────────────────────────"
+if [ "$NON_INTERACTIVE" = true ]; then
+    echo -e "  ${CYAN}Non-interactive mode${NC} (prompts skipped, defaults used)"
+fi
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [1/12] System dependencies
+# [1/13] System dependencies
 # ═══════════════════════════════════════════════════════════════════════════
 step 1 $TOTAL_STEPS "Checking system dependencies..."
 MISSING=""
@@ -58,8 +128,20 @@ for cmd in python3 go git curl; do
 done
 
 if [ -n "$MISSING" ]; then
-    info "Installing missing deps:$MISSING"
-    sudo apt update && sudo apt install -y python3 python3-pip python3-venv golang-go git curl
+    if [ "$NON_INTERACTIVE" = true ]; then
+        info "Installing missing deps:$MISSING (non-interactive)"
+        sudo apt update && sudo apt install -y python3 python3-pip python3-venv golang-go git curl
+    else
+        info "Missing:$MISSING"
+        echo -n "  Install them? [Y/n] "
+        read -r INSTALL_DEPS
+        if [[ ! "$INSTALL_DEPS" =~ ^[Nn] ]]; then
+            sudo apt update && sudo apt install -y python3 python3-pip python3-venv golang-go git curl
+        else
+            err "Missing dependencies — cannot continue"
+            exit 1
+        fi
+    fi
 fi
 
 # Verify versions
@@ -68,27 +150,55 @@ GOV=$(go version 2>&1 | awk '{print $3}')
 ok "Python $PYV | Go $GOV | git $(git --version 2>&1 | awk '{print $3}') | curl $(curl --version 2>&1 | head -1 | awk '{print $2}')"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [2/12] Clone / update kiro-gateway (Python proxy)
+# [2/13] Clone / update kiro-gateway (Python proxy)
 # ═══════════════════════════════════════════════════════════════════════════
 step 2 $TOTAL_STEPS "Cloning kiro-gateway..."
 mkdir -p "$HOME/Documents/proxy"
 if [ -d "$KIRO_DIR/.git" ]; then
     info "Repo exists at $KIRO_DIR — pulling latest..."
     git -C "$KIRO_DIR" pull --ff-only || warn "Could not pull (you may have local changes)"
+elif [ -d "$VENDOR_DIR/kiro-gateway" ] && [ -f "$VENDOR_DIR/kiro-gateway/main.py" ]; then
+    warn "Git clone not possible — using vendored source from $VENDOR_DIR/kiro-gateway"
+    mkdir -p "$KIRO_DIR"
+    cp -r "$VENDOR_DIR/kiro-gateway"/* "$KIRO_DIR/"
+    cp -r "$VENDOR_DIR/kiro-gateway"/.[!.]* "$KIRO_DIR/" 2>/dev/null || true
 else
-    git clone "$KIRO_GATEWAY_REPO" "$KIRO_DIR"
+    git clone "$KIRO_GATEWAY_REPO" "$KIRO_DIR" 2>/dev/null || {
+        warn "Git clone failed — trying vendored fallback"
+        if [ -d "$VENDOR_DIR/kiro-gateway" ] && [ -f "$VENDOR_DIR/kiro-gateway/main.py" ]; then
+            cp -r "$VENDOR_DIR/kiro-gateway"/* "$KIRO_DIR/"
+            cp -r "$VENDOR_DIR/kiro-gateway"/.[!.]* "$KIRO_DIR/" 2>/dev/null || true
+        else
+            err "Cannot fetch kiro-gateway — no network and no vendor source"
+            exit 1
+        fi
+    }
 fi
 ok "kiro-gateway at $KIRO_DIR"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [3/12] Build kirolink (Go token/proxy binary)
+# [3/13] Build kirolink (Go token/proxy binary)
 # ═══════════════════════════════════════════════════════════════════════════
 step 3 $TOTAL_STEPS "Building kirolink (Go binary)..."
 if [ -d "$KIROLINK_DIR/.git" ]; then
     info "Repo exists at $KIROLINK_DIR — pulling latest..."
     git -C "$KIROLINK_DIR" pull --ff-only || warn "Could not pull"
+elif [ -d "$VENDOR_DIR/kirolink" ] && [ -f "$VENDOR_DIR/kirolink/kirolink.go" ]; then
+    warn "Git clone not possible — using vendored source from $VENDOR_DIR/kirolink"
+    mkdir -p "$KIROLINK_DIR"
+    cp -r "$VENDOR_DIR/kirolink"/* "$KIROLINK_DIR/"
+    cp -r "$VENDOR_DIR/kirolink"/.[!.]* "$KIROLINK_DIR/" 2>/dev/null || true
 else
-    git clone "$KIROLINK_REPO" "$KIROLINK_DIR"
+    git clone "$KIROLINK_REPO" "$KIROLINK_DIR" 2>/dev/null || {
+        warn "Git clone failed — trying vendored fallback"
+        if [ -d "$VENDOR_DIR/kirolink" ] && [ -f "$VENDOR_DIR/kirolink/kirolink.go" ]; then
+            cp -r "$VENDOR_DIR/kirolink"/* "$KIROLINK_DIR/"
+            cp -r "$VENDOR_DIR/kirolink"/.[!.]* "$KIROLINK_DIR/" 2>/dev/null || true
+        else
+            err "Cannot fetch kirolink — no network and no vendor source"
+            exit 1
+        fi
+    }
 fi
 
 cd "$KIROLINK_DIR"
@@ -102,7 +212,7 @@ fi
 cd "$OLDPWD"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [4/12] Python virtual environment + dependencies + kiro-cli
+# [4/13] Python virtual environment + dependencies + kiro-cli
 # ═══════════════════════════════════════════════════════════════════════════
 step 4 $TOTAL_STEPS "Setting up Python virtual environment..."
 python3 -m venv "$VENV_DIR"
@@ -118,27 +228,44 @@ deactivate
 ok "Virtual env at $VENV_DIR (kiro-cli + gateway deps)"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [5/12] kiro-cli login (interactive — AWS Builder ID / SSO)
+# [5/13] kiro-cli login (interactive — AWS Builder ID / SSO)
 # ═══════════════════════════════════════════════════════════════════════════
 step 5 $TOTAL_STEPS "kiro-cli authentication (AWS Builder ID / SSO)"
 
 NEED_LOGIN=true
-if [ -f "$KIRO_CLI_DB" ]; then
+
+# --skip-login flag overrides everything
+if [ "$FLAG_SKIP_LOGIN" = true ]; then
+    NEED_LOGIN=false
+    ok "Skipping login (--skip-login)"
+fi
+
+# Check for existing session
+if [ "$NEED_LOGIN" = true ] && [ -f "$KIRO_CLI_DB" ]; then
     DB_SIZE=$(stat -c%s "$KIRO_CLI_DB" 2>/dev/null || stat -f%z "$KIRO_CLI_DB" 2>/dev/null || echo "0")
     if [ "$DB_SIZE" -gt 1000 ]; then
-        warn "Existing kiro-cli DB found ($DB_SIZE bytes)"
-        echo -n "  Reuse existing session? [Y/n] "
-        read -r SKIP_LOGIN
-        if [[ "$SKIP_LOGIN" =~ ^[Nn] ]]; then
-            NEED_LOGIN=true
-        else
+        if [ "$NON_INTERACTIVE" = true ]; then
             NEED_LOGIN=false
-            ok "Reusing existing kiro-cli session"
+            ok "Non-interactive: reusing existing kiro-cli session"
+        else
+            warn "Existing kiro-cli DB found ($DB_SIZE bytes)"
+            echo -n "  Reuse existing session? [Y/n] "
+            read -r SKIP_LOGIN
+            if [[ ! "$SKIP_LOGIN" =~ ^[Nn] ]]; then
+                NEED_LOGIN=false
+                ok "Reusing existing kiro-cli session"
+            fi
         fi
     fi
 fi
 
 if [ "$NEED_LOGIN" = true ]; then
+    if [ "$NON_INTERACTIVE" = true ]; then
+        err "kiro-cli login requires interactive browser — cannot run in non-interactive mode"
+        err "  Run: source $VENV_DIR/bin/activate && kiro-cli login && deactivate"
+        err "  Then re-run installer with --skip-login"
+        exit 1
+    fi
     echo ""
     warn "kiro-cli login requires AWS Builder ID (browser-based OIDC)"
     echo ""
@@ -151,7 +278,7 @@ if [ "$NEED_LOGIN" = true ]; then
     echo "  Sign up: https://builderid.us-east-1.console.aws.amazon.com"
     echo ""
     echo -n "  Press ENTER to start login..."
-    read -r
+    read -r _
     source "$VENV_DIR/bin/activate"
     kiro-cli login || { err "kiro-cli login failed"; deactivate; }
     deactivate
@@ -163,7 +290,7 @@ if [ "$NEED_LOGIN" = true ]; then
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [6/12] Kirolink data: token cache setup + verification
+# [6/13] Kirolink data: token cache setup + verification
 # ═══════════════════════════════════════════════════════════════════════════
 step 6 $TOTAL_STEPS "Kirolink data — token cache setup"
 
@@ -209,7 +336,7 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [7/12] Create .env for kiro-gateway
+# [7/13] Create .env for kiro-gateway
 # ═══════════════════════════════════════════════════════════════════════════
 step 7 $TOTAL_STEPS "Creating .env for kiro-gateway..."
 if [ -f "$KIRO_DIR/.env" ]; then
@@ -240,7 +367,7 @@ KIROENV
 ok "Environment helper at \$HOME/.kiro-env (source for shell access)"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [8/12] Systemd service: kiro-gateway
+# [8/13] Systemd service: kiro-gateway
 # ═══════════════════════════════════════════════════════════════════════════
 step 8 $TOTAL_STEPS "Creating systemd service: kiro-gateway (port $KIRO_PORT)..."
 mkdir -p "$SYSD_DIR"
@@ -268,14 +395,22 @@ systemctl --user enable "$GATEWAY_SERVICE" 2>&1 || warn "systemd enable failed (
 ok "systemd: $GATEWAY_SERVICE enabled"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [9/12] (Optional) Systemd service: kirolink token proxy
+# [9/13] (Optional) Systemd service: kirolink token proxy
 # ═══════════════════════════════════════════════════════════════════════════
 step 9 $TOTAL_STEPS "Creating systemd service: kirolink (port $KIROLINK_PORT)..."
 
-echo -n "  Install kirolink as a systemd service? [y/N] "
-read -r INSTALL_KIROLINK_SERVICE
+INSTALL_KIROLINK_SERVICE=false
+if [ "$FLAG_KIROLINK_SERVICE" = true ]; then
+    INSTALL_KIROLINK_SERVICE=true
+elif [ "$NON_INTERACTIVE" != true ]; then
+    echo -n "  Install kirolink as a systemd service? [y/N] "
+    read -r RESPONSE
+    if [[ "$RESPONSE" =~ ^[Yy] ]]; then
+        INSTALL_KIROLINK_SERVICE=true
+    fi
+fi
 
-if [[ "$INSTALL_KIROLINK_SERVICE" =~ ^[Yy] ]]; then
+if [ "$INSTALL_KIROLINK_SERVICE" = true ]; then
     cat > "$SYSD_DIR/$KIROLINK_SERVICE" << SYSEOF
 [Unit]
 Description=Kirolink — Anthropic proxy via CodeWhisperer (token-managed)
@@ -298,13 +433,69 @@ SYSEOF
     ok "systemd: $KIROLINK_SERVICE enabled"
 else
     warn "Skipping kirolink systemd service"
-    info "  Start manually: $KIROLINK_DIR/kirolink server $KIROLINK_PORT"
+    [ "$NON_INTERACTIVE" != true ] && info "  Start manually: $KIROLINK_DIR/kirolink server $KIROLINK_PORT"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [10/12] Start + verify kiro-gateway
+# [10/13] Systemd timer: hourly auth token refresh
 # ═══════════════════════════════════════════════════════════════════════════
-step 10 $TOTAL_STEPS "Starting kiro-gateway and verifying..."
+step 10 $TOTAL_STEPS "Creating systemd timer: kiro-auth-refresh (hourly)..."
+
+INSTALL_REFRESH_TIMER=false
+if [ "$NON_INTERACTIVE" = true ]; then
+    INSTALL_REFRESH_TIMER=true
+    info "Non-interactive: installing auth refresh timer by default"
+else
+    echo -n "  Install hourly auth refresh timer? (prevents 504 errors) [Y/n] "
+    read -r RESPONSE
+    if [[ ! "$RESPONSE" =~ ^[Nn] ]]; then
+        INSTALL_REFRESH_TIMER=true
+    fi
+fi
+
+if [ "$INSTALL_REFRESH_TIMER" = true ]; then
+    # Oneshot service that runs kirolink refresh
+    cat > "$SYSD_DIR/$REFRESH_SERVICE" << SYSEOF
+[Unit]
+Description=Kiro auth token refresh — syncs SSO token via kirolink
+Documentation=https://github.com/alexandeism/kirolink
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=$KIROLINK_DIR/kirolink refresh
+WorkingDirectory=$KIROLINK_DIR
+SYSEOF
+
+    # Timer that fires hourly with randomized delay
+    cat > "$SYSD_DIR/$REFRESH_TIMER" << SYSEOF
+[Unit]
+Description=Hourly Kiro auth token refresh
+Documentation=https://github.com/alexandeism/kirolink
+RefuseManualStart=no
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+SYSEOF
+
+    systemctl --user daemon-reload
+    systemctl --user enable "$REFRESH_TIMER" 2>&1 || warn "systemd enable failed"
+    systemctl --user start "$REFRESH_TIMER" 2>&1 || warn "systemd start failed"
+    ok "systemd: $REFRESH_TIMER enabled and started (hourly refresh)"
+else
+    warn "Skipping auth refresh timer"
+    info "  Install later: cp systemd/kiro-auth-refresh.* $SYSD_DIR/ && systemctl --user daemon-reload && systemctl --user enable --now kiro-auth-refresh.timer"
+fi
+
+# ═══════════════════════════════════════════════════════════════════════════
+# [11/13] Start + verify kiro-gateway
+# ═══════════════════════════════════════════════════════════════════════════
+step 11 $TOTAL_STEPS "Starting kiro-gateway and verifying..."
 
 systemctl --user start "$GATEWAY_SERVICE" || { err "Failed to start $GATEWAY_SERVICE"; }
 sleep 6
@@ -351,11 +542,13 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [11/12] Wire into opencode.jsonc
+# [12/13] Wire into opencode.jsonc
 # ═══════════════════════════════════════════════════════════════════════════
-step 11 $TOTAL_STEPS "Wiring into opencode.jsonc..."
+step 12 $TOTAL_STEPS "Wiring into opencode.jsonc..."
 
-if [ ! -f "$OPENCODE_CONFIG" ]; then
+if [ "$FLAG_SKIP_OPENCODE" = true ]; then
+    warn "Skipping opencode wiring (--skip-opencode)"
+elif [ ! -f "$OPENCODE_CONFIG" ]; then
     warn "opencode.jsonc not found at $OPENCODE_CONFIG — skipping"
 else
     # Build models JSON for the kiro provider
@@ -460,9 +653,9 @@ PYEOF
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
-# [12/12] Summary
+# [13/13] Summary
 # ═══════════════════════════════════════════════════════════════════════════
-step 12 $TOTAL_STEPS "Installation complete"
+step 13 $TOTAL_STEPS "Installation complete"
 
 echo ""
 echo -e "${GREEN}${BOLD}  🦉 Kiro Stack is installed!${NC}"
@@ -482,9 +675,13 @@ echo ""
 echo -e "${BOLD}  ├─ Services${NC}"
 STATUS=$(systemctl --user is-active "$GATEWAY_SERVICE" 2>/dev/null || echo "unknown")
 echo "  │  ├─ $GATEWAY_SERVICE  [$STATUS]"
-if [[ "$INSTALL_KIROLINK_SERVICE" =~ ^[Yy] ]] && [ -f "$SYSD_DIR/$KIROLINK_SERVICE" ]; then
+if [ "$INSTALL_KIROLINK_SERVICE" = true ] && [ -f "$SYSD_DIR/$KIROLINK_SERVICE" ]; then
     KSTATUS=$(systemctl --user is-active "$KIROLINK_SERVICE" 2>/dev/null || echo "stopped")
-    echo "  │  └─ $KIROLINK_SERVICE  [$KSTATUS]"
+    echo "  │  ├─ $KIROLINK_SERVICE  [$KSTATUS]"
+fi
+if [ "$INSTALL_REFRESH_TIMER" = true ] && [ -f "$SYSD_DIR/$REFRESH_TIMER" ]; then
+    TSTATUS=$(systemctl --user is-active "$REFRESH_TIMER" 2>/dev/null || echo "inactive")
+    echo "  │  └─ $REFRESH_TIMER  [$TSTATUS] (hourly token refresh)"
 fi
 echo ""
 echo -e "${BOLD}  ├─ Models in opencode${NC}"
@@ -502,7 +699,8 @@ echo -e "${BOLD}  ├─ Management${NC}"
 echo "  │  ├─ systemctl --user status $GATEWAY_SERVICE"
 echo "  │  ├─ systemctl --user restart $GATEWAY_SERVICE"
 echo "  │  ├─ journalctl --user -u $GATEWAY_SERVICE -n 50 -f"
-echo "  │  └─ journalctl --user -u $KIROLINK_SERVICE -n 50 -f"
+echo "  │  ├─ systemctl --user status $REFRESH_TIMER"
+echo "  │  └─ journalctl --user -u $REFRESH_SERVICE -n 50 -f"
 echo ""
 echo -e "${BOLD}  ├─ Quick verification${NC}"
 echo "  │  ├─ curl http://localhost:$KIRO_PORT/health"
@@ -513,6 +711,7 @@ echo -e "${BOLD}  └─ Auth refresh (when tokens expire ~24h)${NC}"
 echo "     $ source $VENV_DIR/bin/activate && kiro-cli login && deactivate"
 echo "     $ systemctl --user restart $GATEWAY_SERVICE"
 echo "     $ $KIROLINK_DIR/kirolink refresh"
+echo "     Or rely on the systemd timer (runs hourly)"
 echo ""
 
 # Final end-to-end

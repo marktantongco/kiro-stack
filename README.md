@@ -21,10 +21,11 @@ A complete stack for accessing Kiro (Amazon Q Developer / CodeWhisperer) models 
 opencode TUI ──→ kiro-gateway (8333) ──→ CodeWhisperer API ──→ Kiro/Claude models
                       ↑                        ↑
                  kiro-cli auth           kirolink token refresh
-                 (SQLite DB)             (JSON token cache)
-                     │                        │
-                     └──── AWS SSO OIDC ──────┘
-                          (Builder ID)
+                 (SQLite DB)       ┌──── (JSON token cache)
+                     │             │         │
+                     └─ AWS SSO ───┘    systemd timer
+                        OIDC           (hourly refresh)
+                     (Builder ID)
 ```
 
 ### Models available (9 total)
@@ -59,20 +60,46 @@ chmod +x install.sh
 ./install.sh
 ```
 
-The installer is interactive. Steps:
+### Install options (flags)
+
+```bash
+# Fully automated — no prompts
+./install.sh --non-interactive --kirolink-service
+
+# Reuse existing auth, skip opencode wiring
+./install.sh --skip-login --skip-opencode
+
+# Just validate configuration
+./install.sh --dry-run
+
+# Show all flags
+./install.sh --help
+```
+
+| Flag | What it does |
+|------|-------------|
+| `--non-interactive` | Skip all prompts (defaults: reuse login, skip kirolink service, install timer) |
+| `--kirolink-service` | Install kirolink as systemd service |
+| `--skip-login` | Skip kiro-cli login (use existing session) |
+| `--skip-opencode` | Skip opencode.jsonc wiring |
+| `--dry-run` | Validate config and exit |
+| `-h`, `--help` | Show usage |
+
+### Installer steps (13 total)
 
 1. Checks system dependencies (installs missing packages)
-2. Clones kiro-gateway from GitHub
-3. Builds kirolink Go binary from source
+2. Clones kiro-gateway from GitHub (falls back to `vendor/` if offline)
+3. Builds kirolink Go binary from source (falls back to `vendor/` if offline)
 4. Creates Python venv with kiro-cli and dependencies
 5. Guides through kiro-cli login (AWS Builder ID / browser OIDC)
 6. Sets up token cache and runs kirolink refresh
 7. Creates `.env` for kiro-gateway
 8. Installs kiro-gateway as a systemd user service
 9. Optionally installs kirolink as a systemd service
-10. Starts and verifies kiro-gateway end-to-end
-11. Wires kiro provider into opencode.jsonc
-12. Prints summary with management commands
+10. Creates systemd timer for hourly auth token refresh
+11. Starts and verifies kiro-gateway end-to-end
+12. Wires kiro provider into opencode.jsonc
+13. Prints summary with management commands
 
 ### After install
 
@@ -121,29 +148,39 @@ systemctl --user status kirolink.service
 journalctl --user -u kirolink.service -n 50 -f
 ```
 
+### Auth refresh timer (prevents 504 errors)
+
+```bash
+# Status
+systemctl --user status kiro-auth-refresh.timer
+
+# Logs
+journalctl --user -u kiro-auth-refresh.service -n 50 -f
+
+# Manual trigger
+systemctl --user start kiro-auth-refresh.service
+```
+
+The timer runs `kirolink refresh` hourly with a randomized 10-minute delay. This keeps your token fresh and prevents the silent 504/502 failures that happen when the ~24h SSO token expires.
+
 ---
 
 ## Auth lifecycle
 
 Kiro uses AWS SSO OIDC via Builder ID. Tokens expire approximately every 24 hours.
 
-### When auth expires (gateway returns 504/502):
+### The three layers of auth defense:
+
+1. **Hourly timer** (`kiro-auth-refresh.timer`) — proactively syncs the token from kiro-cli DB to the JSON cache. Prevents most expiry issues before they happen.
+2. **kirolink auto-refresh** — if kirolink gets a 403 when proxying, it automatically refreshes the token and retries.
+3. **Manual refresh** — when all else fails (e.g., the SSO session itself expired):
 
 ```bash
-# 1. Re-authenticate
 source ~/Documents/proxy/kiro-gateway/.venv/bin/activate
 kiro-cli logout && kiro-cli login
 deactivate
-
-# 2. Restart gateway to pick up new token
 systemctl --user restart kiro-gateway.service
-
-# 3. (Optional) Sync token cache for kirolink
 ~/Documents/proxy/kirolink/kirolink refresh
-
-# 4. Verify
-curl http://localhost:8333/health
-curl http://localhost:8333/v1/models -H 'Authorization: Bearer kiro-gateway-8333'
 ```
 
 ### Quick one-liner (if kiro-cli already logged in):
@@ -169,32 +206,84 @@ eval "$(~/Documents/proxy/kirolink/kirolink export)"
 claude
 ```
 
-Or install the systemd service (option during `install.sh`).
+Or install the systemd service (`--kirolink-service` flag during install).
+
+---
+
+## Vendor fallback
+
+This repo includes vendored snapshots of both upstream sources in `vendor/`:
+
+```
+vendor/
+├── kiro-gateway/     # Snapshot of github.com/Jwadow/kiro-gateway
+└── kirolink/         # Snapshot of github.com/alexandeism/kirolink
+```
+
+The installer tries git clone first. If that fails (no network, repo down), it falls back to the vendored copy. This makes the installer fully offline-capable.
+
+To update the vendored sources:
+
+```bash
+# Refresh kiro-gateway
+rm -rf vendor/kiro-gateway
+git clone https://github.com/Jwadow/kiro-gateway.git /tmp/kiro-gateway-fresh
+cp -r /tmp/kiro-gateway-fresh/* vendor/kiro-gateway/
+rm -rf /tmp/kiro-gateway-fresh
+
+# Refresh kirolink
+rm -rf vendor/kirolink
+git clone https://github.com/alexandeism/kirolink.git /tmp/kirolink-fresh
+cp -r /tmp/kirolink-fresh/* vendor/kirolink/
+rm -rf /tmp/kirolink-fresh
+```
+
+---
+
+## Development
+
+### Running tests
+
+```bash
+# Lint check
+bash -n install.sh
+
+# Mock fresh-machine test
+test/mock_test.sh
+
+# ShellCheck (requires shellcheck)
+shellcheck install.sh
+```
+
+### CI
+
+This repo runs ShellCheck on every push/PR via GitHub Actions (`.github/workflows/shellcheck.yml`).
 
 ---
 
 ## Directory layout
 
 ```
-~/Documents/proxy/
-├── kiro-gateway/          # Cloned from github.com/Jwadow/kiro-gateway
-│   ├── .venv/             # Python virtual environment
-│   ├── main.py            # Gateway server
-│   └── .env               # Configuration
-└── kirolink/              # Cloned from github.com/alexandeism/kirolink
-    ├── kirolink           # Built Go binary
-    ├── kirolink.go        # Source
-    └── protocol/          # SSE parser
+kiro-stack/                   # This repo
+├── install.sh                # Unified installer (528 lines)
+├── README.md                 # This file
+├── .gitignore
+├── .github/workflows/
+│   └── shellcheck.yml        # CI: lint on push
+├── systemd/
+│   ├── kiro-auth-refresh.service   # Oneshot refresh
+│   └── kiro-auth-refresh.timer     # Hourly timer
+├── test/
+│   └── mock_test.sh          # Sandbox test suite
+└── vendor/
+    ├── kiro-gateway/         # Vendored upstream source
+    └── kirolink/             # Vendored upstream source
 
 ~/.config/systemd/user/
-├── kiro-gateway.service  # Systemd unit for gateway
-└── kirolink.service       # Systemd unit for kirolink (optional)
-
-~/.local/share/kiro-cli/
-└── data.sqlite3           # kiro-cli auth database
-
-~/.aws/sso/cache/
-└── kiro-auth-token.json   # Kirolink token cache
+├── kiro-gateway.service      # Gateway (systemd-managed)
+├── kirolink.service           # Kirolink proxy (optional)
+├── kiro-auth-refresh.service  # Token refresh (oneshot)
+└── kiro-auth-refresh.timer    # Hourly refresh timer
 ```
 
 ---
@@ -215,7 +304,14 @@ journalctl --user -u kiro-gateway.service --no-pager -n 30
 
 ### 504 / 502 errors from gateway
 
-Token expired. See [auth lifecycle](#auth-lifecycle) above.
+Token expired. Check the refresh timer first:
+
+```bash
+systemctl --user status kiro-auth-refresh.timer
+journalctl --user -u kiro-auth-refresh.service -n 10
+```
+
+If the timer ran but the session itself expired (not just the cached token):
 
 ```bash
 source ~/Documents/proxy/kiro-gateway/.venv/bin/activate

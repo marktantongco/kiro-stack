@@ -16,9 +16,17 @@ __pycache__/
 *.egg-info/
 dist/
 
-# Go (kirolink build artifacts - source is in this repo as ref, binary is local)
+# Go (kirolink build artifacts - binary, not source)
 kirolink/kirolink
 kirolink/kirolink.exe
 
 # Logs
 *.log
+
+# Test artifacts
+test/tmp/
+
+# Sensitive files that may be in vendor (local install artifacts)
+vendor/kiro-gateway/.env
+vendor/kiro-gateway/credentials.json
+vendor/kiro-gateway/state.json
