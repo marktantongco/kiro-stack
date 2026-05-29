@@ -416,10 +416,10 @@ async def messages(
             logger.debug(f"Kiro API URL: {url} (account: {account.id})")
             
             if request_data.stream:
-                http_client = KiroHttpClient(auth_manager, shared_client=None)
+                http_client = KiroHttpClient(auth_manager, shared_client=None, optimistic_failover=True)
             else:
                 shared_client = request.app.state.http_client
-                http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+                http_client = KiroHttpClient(auth_manager, shared_client=shared_client, optimistic_failover=True)
             
             # Prepare data for token counting
             messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
