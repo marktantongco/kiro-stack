@@ -5,7 +5,7 @@
 set -euo pipefail
 
 # ── Configuration ──────────────────────────────────────────────────────────
-KIRO_GATEWAY_REPO="https://github.com/Jwadow/kiro-gateway.git"
+KIRO_GATEWAY_REPO="https://github.com/marktantongco/kiro-gateway.git"
 KIROLINK_REPO="https://github.com/alexandeism/kirolink.git"
 
 KIRO_DIR="$HOME/Documents/proxy/kiro-gateway"
